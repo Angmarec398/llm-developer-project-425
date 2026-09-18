@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Bash(type*env*)",
+      "Bash(cat*env*)",
+      "Bash(more*env*)",
+      "Bash(Get-Content*env*)",
+      
+      "Read(*authorized_key.json)",
+      "Bash(type*authorized_key.json*)",
+      "Bash(cat*authorized_key.json*)",
+      "Bash(more*authorized_key.json*)",
+      "Bash(Get-Content*authorized_key.json*)",
+      
+      "Read(pg_tunnel_user)",
+      "Bash(cat*pg_tunnel_user*)",
+      "Bash(type*pg_tunnel_user*)",
+      "Bash(more*pg_tunnel_user*)",
+      "Bash(Get-Content*pg_tunnel_user*)"
+    ]
+  }
+}
