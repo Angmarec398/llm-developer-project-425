@@ -42,8 +42,8 @@ ID, сами значения хранятся только в Lockbox):
 `LOCKBOX_PAYLOAD_KEY` в `.env`) — это же имя используется при деплое Cloud
 Function: `--secret environment-variable=secret-id/version-id/PAYLOAD_KEY`.
 
-App-password для почтового ящика (IMAP/SMTP) будет добавлен в Lockbox на
-шаге про email-workflow.
+Пароль почтового ящика (IMAP/SMTP) хранится в отдельном секрете
+`email-credentials` (ключ payload — `email_password`), см. шаг 4.
 
 ### Агент в Yandex AI Studio
 
@@ -51,3 +51,38 @@ App-password для почтового ящика (IMAP/SMTP) будет доб�
 - `agent_id` записан в `.env` как `AI_STUDIO_AGENT_ID`.
 - Сервисный аккаунт к агенту не привязывается — авторизация идёт через
   IAM-токен вызывающей Cloud Function (см. таблицу ролей выше).
+
+### Email-workflow (шаг 4)
+
+Почтовый агент: раз в минуту забирает непрочитанные письма, передаёт текст
+в YandexGPT и отправляет ответ отправителю.
+
+```
+Timer (раз в минуту) → Cloud Function email-poller → IMAP fetch → YandexGPT (Responses API) → SMTP send
+```
+
+- **Почта:** ящик `helpdesk_hexlet@cif-raz.ru` на Reg.ru (ISPmanager);
+  IMAP и SMTP — `mail.hosting.reg.ru` (порты 993 и 465), вход по логину и
+  паролю ящика.
+- **Секрет:** `email-credentials` в Lockbox, ключ payload — `email_password`
+  (в функцию попадает как `IMAP_PASSWORD` и `SMTP_PASSWORD`).
+- **Функция:** `email-poller` (код — [src/email_poller.py](src/email_poller.py),
+  точка входа `email_poller.handle`).
+- **Триггер:** `email-poller-trigger`, cron `0/1 * * * ? *`, вызывает
+  `$latest`-версию функции.
+- **Переменные окружения функции:** `YC_FOLDER_ID`, `IMAP_HOST`, `SMTP_HOST`,
+  `IMAP_USER`, `SMTP_USER`, `HELPDESK_MAILBOX`, `OPERATOR_EMAIL`, а также
+  секреты `IMAP_PASSWORD` и `SMTP_PASSWORD`.
+- **Модель:** пока вызывается напрямую (`gpt://<folder>/yandexgpt/latest` +
+  `instructions`), а не через агента: `prompt.id` с `agent_id` из Agent
+  Atelier отвечает `404`. К агенту вернёмся на шагах с MCP-инструментами и RAG.
+- **Защита от петель:** письма от самого ящика и автоответы
+  (`Auto-Submitted`) пропускаются; каждое письмо помечается `\Seen`, даже
+  если обработка упала.
+
+Проверка по логам: `yc serverless function logs email-poller --limit 30`.
+Успешная обработка письма выглядит так:
+
+```
+GOT_UNSEEN=1 → MSG num=… from=… subject=… → AGENT_OK len=… → SEND_OK to=…
+```

@@ -46,12 +46,12 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
 - [x] Шаг 2 — подготовка окружения: репозиторий, `yc`, каталог, YDB Serverless.
 - [x] Шаг 3 — права и секреты: сервисный аккаунт, роли, Lockbox, агент в
       Agent Atelier. Детали — в [README.md](README.md).
-- [~] Шаг 4 — базовый email-workflow (`docs/Шаг 4.pdf`): **почти готов**.
-      Функция `email-poller-v2` работает, письма обрабатываются и по таймеру,
-      ответ от YandexGPT приходит. Осталось: (1) убедиться, что после
-      последнего передеплоя (принудительный flush логов) в логах видна вся
-      цепочка `GOT_UNSEEN → MSG → AGENT_OK → SEND_OK`; (2) обновить README;
-      (3) сдать шаг. Детали и особенности — в разделе «Шаг 4» ниже.
+- [~] Шаг 4 — базовый email-workflow (`docs/Шаг 4.pdf`): **готов к сдаче**.
+      Функция `email-poller` работает по таймеру; 2026-09-21 19:42 в логах
+      подтверждена вся цепочка `GOT_UNSEEN → MSG → AGENT_OK → SEND_OK`
+      (тестовое письмо от `director@cif-raz.ru`), повторной обработки нет.
+      Ответ дошёл в ящик отправителя (подтверждено пользователем).
+      README обновлён. Осталось: закоммитить и сдать шаг. Детали — в разделе «Шаг 4» ниже.
 - [ ] Шаг 5 и далее — MCP-инструмент `ydb-tickets` + YDB, RAG, авто-эскалация
       тикетов, безопасность (prompt injection, PII), наблюдаемость (трейсы,
       токены), финальное ревью.
@@ -98,14 +98,17 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
 - Секрет Lockbox `email-credentials`: `secret_id=e6qtoe9qgsma9dp598h4`,
   `version_id=e6q0mrrnukuk4n6a9vfl`, ключ payload — `email_password`
   (не `password`, как в PDF; так решил пользователь).
-- Cloud Function **`email-poller-v2`** (`function_id=d4eplkj8g376i602ddpp`,
-  код — `src/email_poller.py`, точка входа `email_poller.handle`). Старая
-  `email-poller` (`d4e3222ra0sdp5ld4hqo`) зависла в статусе `DELETING` —
-  когда исчезнет, можно вернуть имя `email-poller` (задание называет её так).
+- Cloud Function **`email-poller`** (`function_id=d4eplkj8g376i602ddpp`,
+  код — `src/email_poller.py`, точка входа `email_poller.handle`). Раньше
+  называлась `email-poller-v2`, потому что старая функция с этим именем
+  (`d4e3222ra0sdp5ld4hqo`) зависла в `DELETING`; после её удаления
+  переименована в `email-poller` (2026-09-21), как в задании.
 - Timer-триггер `email-poller-trigger` (`a1s7d2d0ih0l3bnl2jur`), cron
-  `0/1 * * * ? *`, вызывает `email-poller-v2` с тегом `$latest`.
+  `0/1 * * * ? *`, вызывает `email-poller` с тегом `$latest` (привязан по ID,
+  переименование его не затронуло).
 - Переменные окружения функции: `YC_FOLDER_ID`, `IMAP_HOST`, `SMTP_HOST`,
-  `IMAP_USER`, `SMTP_USER`, `HELPDESK_MAILBOX`, `OPERATOR_EMAIL`; секреты
+  `IMAP_USER`, `SMTP_USER`, `HELPDESK_MAILBOX`, `OPERATOR_EMAIL` (последняя
+  в коде `email_poller.py` пока не читается — нужна для дайджеста); секреты
   `IMAP_PASSWORD`/`SMTP_PASSWORD` из `email-credentials`. Команда деплоя —
   `yc serverless function version create` (см. `docs/Шаг 4.pdf`, задача 4).
 - **Вызов агента через `prompt.id` не работает**: `agent_id` из Agent
@@ -119,23 +122,41 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
   учесть в промпте/RAG на следующих шагах.
 - `.env.example` содержит `MAIL`, `MAIL_PASSWORD`, `MAIL_SERVER` (правка
   пользователя) — они для локальной работы; в облаке функция читает
-  `IMAP_*`/`SMTP_*`.
+  `IMAP_*`/`SMTP_*`. Ключ пароля в Lockbox — `email_password` (в
+  `.env.example` комментарий приведён в соответствие).
+- В коде дефолты `IMAP_HOST`/`SMTP_HOST` — Яндекс, реальные значения
+  (`mail.hosting.reg.ru`) приходят из окружения функции. `AI_STUDIO_AGENT_ID`
+  читается, но пока не используется; модель — `MODEL` (по умолчанию
+  `yandexgpt/latest`).
 
 ## Локальное окружение
 
-- `yc` CLI установлен, но **не в PATH** по умолчанию:
-  `C:\Users\ASUS\yandex-cloud\bin\yc.exe`. В новой PowerShell-сессии:
+- `yc` CLI установлен, но **не в PATH** по умолчанию (путь зависит от
+  машины; на одной из них — `C:\Users\ASUS\yandex-cloud\bin\yc.exe`, на
+  другой `yc` уже в PATH). В новой PowerShell-сессии:
   `$env:Path += ";C:\Users\ASUS\yandex-cloud\bin"`.
 - Профиль `yc` уже авторизован и указывает на каталог `b1gtltvclf9uth3u1r37`.
 - `.env` — реальные значения, в `.gitignore`, **инструменту Claude в этой
   среде запрещено читать/редактировать `.env` настройками разрешений** —
   все правки в него просит сделать пользователь сам (давать ему готовые
   строки для вставки).
+- Права Claude в `.claude/settings.json` (общие, в git) и
+  `.claude/settings.local.json` (личные, в `.gitignore`); пути в них
+  относительные. `.env` — запрещены Read/Edit/Write и чтение через
+  `cat`/`type`/`more`/`Get-Content`; `.env.example` — разрешён. Также закрыты
+  `*authorized_key.json` и `pg_tunnel_user`.
 - `.env.example` — шаблон переменных без значений, поддерживается в
   актуальном состоянии, отражает все переменные из `.env`.
-- `requirements.txt` — есть пакет `ydb` (нужен для инициализации схемы на
-  шаге про MCP/YDB). Пакет `yandex-ai-studio-sdk` понадобится на шаге про
-  RAG — ещё не добавлен.
+- `requirements.txt` — в кодировке UTF-16 (с BOM); пакет `ydb` (нужен для
+  инициализации схемы на шаге про MCP/YDB) и его зависимости. Пакет
+  `yandex-ai-studio-sdk` понадобится на шаге про RAG — ещё не добавлен.
+- `src/email_poller.py` — единственный файл кода; использует только stdlib.
+
+## Последний проверенный коммит
+
+`fa93ef7` («Выполнение шага 4») — на этом коммите README.md и CLAUDE.md
+сверены с состоянием проекта (2026-09-21). При следующей актуализации
+смотреть изменения `git diff fa93ef7..HEAD`.
 
 ## Как работаем (важно)
 
