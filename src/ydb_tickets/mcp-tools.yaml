@@ -1,0 +1,15 @@
+- name: create-ticket
+  description: "Создать тикет службы поддержки по обращению пользователя"
+  input_json_schema: '{"type":"object","properties":{"user_id":{"type":"string","description":"Email отправителя обращения"},"category":{"type":"string","enum":["bug","docs","feature","access"],"description":"Категория обращения"},"text":{"type":"string","description":"Текст обращения"}},"required":["user_id","category","text"]}'
+  action:
+    function_call:
+      function_id: d4eqej760k5k669iniqq
+      tag: $latest
+
+- name: list-my-tickets
+  description: "Показать ранее созданные тикеты пользователя по его user_id"
+  input_json_schema: '{"type":"object","properties":{"user_id":{"type":"string","description":"Email отправителя, чьи тикеты нужно найти"}},"required":["user_id"]}'
+  action:
+    function_call:
+      function_id: d4eqej760k5k669iniqq
+      tag: $latest

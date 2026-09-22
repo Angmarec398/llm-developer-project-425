@@ -46,15 +46,21 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
 - [x] Шаг 2 — подготовка окружения: репозиторий, `yc`, каталог, YDB Serverless.
 - [x] Шаг 3 — права и секреты: сервисный аккаунт, роли, Lockbox, агент в
       Agent Atelier. Детали — в [README.md](README.md).
-- [~] Шаг 4 — базовый email-workflow (`docs/Шаг 4.pdf`): **готов к сдаче**.
-      Функция `email-poller` работает по таймеру; 2026-09-21 19:42 в логах
-      подтверждена вся цепочка `GOT_UNSEEN → MSG → AGENT_OK → SEND_OK`
-      (тестовое письмо от `director@cif-raz.ru`), повторной обработки нет.
-      Ответ дошёл в ящик отправителя (подтверждено пользователем).
-      README обновлён. Осталось: закоммитить и сдать шаг. Детали — в разделе «Шаг 4» ниже.
-- [ ] Шаг 5 и далее — MCP-инструмент `ydb-tickets` + YDB, RAG, авто-эскалация
-      тикетов, безопасность (prompt injection, PII), наблюдаемость (трейсы,
-      токены), финальное ревью.
+- [x] Шаг 4 — базовый email-workflow (`docs/Шаг 4.pdf`). Функция
+      `email-poller` работает по таймеру, цепочка `GOT_UNSEEN → MSG →
+      AGENT_OK → SEND_OK` подтверждена в логах, ответ доходит до
+      отправителя. Сдан (коммит «Выполнено 4 шага из 10»).
+- [~] Шаг 5 — MCP-инструмент `ydb-tickets` + YDB (`docs/Шаг 5.pdf`):
+      **готов к сдаче**. Таблицы `tickets`/`messages` созданы, CF
+      `ydb-tickets` отвечает корректным JSON на `create-ticket` и
+      `list-my-tickets`, MCP-шлюз `ydb-tickets-mcp` создан через CLI,
+      `email-poller` вызывает агента с подключённым MCP-инструментом и
+      пишет историю/телеметрию в `messages`. 2026-09-22 end-to-end
+      проверено по почте (создание тикета + multi-turn история +
+      PII-маскирование в логах и в YDB) — см. раздел «Шаг 5» ниже.
+      Осталось: закоммитить и сдать шаг.
+- [ ] Шаг 6 и далее — RAG, авто-эскалация тикетов, безопасность (prompt
+      injection), наблюдаемость (трейсы), финальное ревью.
 
 Формулировки задач каждого шага — в `docs/Шаг N.pdf`. Общий контекст и
 критерии сдачи проекта — в `docs/Общие данные.pdf`.
@@ -86,6 +92,11 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
 - Прочие существующие SA в каталоге (не относятся к этому проекту, не
   трогать): `ai-studio-7c2d91`, `ai-studio-8557b7`, `hexlet-ai-agent`,
   `auto-generated-workflow-editor-493`.
+- Cloud Function `ydb-tickets`: `function_id=d4eqej760k5k669iniqq`, код —
+  `src/ydb_tickets/index.py`, точка входа `index.handle`.
+- MCP Hub gateway `ydb-tickets-mcp`: `gateway_id=db8aoe7ahsu56rr7u571`,
+  SSE-URL — `https://db8aoe7ahsu56rr7u571.zfnhylrb.mcpgw.serverless.yandexcloud.net/sse`
+  (используется как `MCP_GATEWAY_URL` в `email-poller`).
 
 Полное соответствие «секрет → зачем → куда положен» — в разделе
 «Права и секреты» в [README.md](README.md).
@@ -129,6 +140,74 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
   читается, но пока не используется; модель — `MODEL` (по умолчанию
   `yandexgpt/latest`).
 
+## Шаг 5: MCP ydb-tickets (текущее состояние)
+
+- **Схема YDB** — `src/ydb_tickets/schema.sql` (таблицы `tickets`,
+  `messages`, PK `messages` — `(user_id, id)`, `ticket_id` — Nullable).
+  Применяется через `scripts/init_schema.py` (Python SDK, IAM-токен через
+  `YC_IAM_TOKEN`) — второй способ из задачи 1, UI-консоль тоже подходит.
+  Скрипт вырезает всё после `--` до конца строки перед разбиением на
+  statement'ы по `;` (наивное разбиение ломалось на `;` внутри инлайн-
+  комментария `-- ссылка на tickets.id; NULL, ...`).
+- **Cloud Function `ydb-tickets`** (`src/ydb_tickets/index.py`) реализует
+  `create-ticket` и `list-my-tickets`, диспетчеризация по трём контрактам
+  вызова (`_resolve_action`): прямой invoke (`action` в event), HTTP через
+  API Gateway (`httpMethod`+`body`), MCP Hub (аргументы инструмента как
+  event напрямую, без `action` — определяется по набору ключей). PII
+  текста тикета маскируется через `mask_pii` (см. ниже) перед записью.
+  Особенность ydb-python-sdk: колонки `Timestamp` при чтении приходят как
+  `int` (микросекунды от эпохи), а не `datetime` — конвертация в
+  `_format_timestamp`.
+- **PII-маскирование** — `src/pii_mask.py`, общий модуль для CF
+  `ydb-tickets` и `email_poller.py` (упаковывается в оба zip). Простая
+  regex-маскировка email и телефонов; текст сначала маскируется, потом
+  пишется в YDB.
+- **MCP Hub gateway `ydb-tickets-mcp`** создан через
+  `yc serverless mcp-gateway create --tools-file src/ydb_tickets/mcp-tools.yaml`
+  (см. ID выше). Оба инструмента в `mcp-tools.yaml` указывают на тот же
+  `function_id` — диспетчеризация внутри CF.
+- **`email-poller` доработан**: перед вызовом агента читает последние
+  `HISTORY_LIMIT` (по умолчанию 10) реплик пользователя из `messages`
+  (`ORDER BY created_at DESC`, разворачивает в хронологический порядок),
+  пишет входящее письмо (`role=user`, PII замаскирован, `ticket_id=NULL`)
+  до вызова LLM. Запрос к Responses API включает `tools: [{"type": "mcp",
+  "server_url": MCP_GATEWAY_URL, "require_approval": "never"}]` и историю
+  в `input` (role `agent`→`assistant`). После ответа: замеряет
+  `latency_ms` (`time.monotonic()` вокруг вызова), достаёт `ticket_id` из
+  `output[].type=="mcp_call"` с `name=="create-ticket"` (парсит JSON в
+  поле `output` этого элемента), пишет ответ агента (`role=agent`,
+  `model`, `tokens_in/out` из `usage`, `latency_ms`, тот же `ticket_id`) и
+  UPDATE'ом проставляет `ticket_id` входящей реплике, если тикет заведён
+  в этом же цикле. Системный промпт обновлён — описывает, когда вызывать
+  `create-ticket`, когда `list-my-tickets`; email отправителя передаётся
+  моделью как `user_id` через `instructions` (динамически, на каждый
+  запрос).
+  Деплой поллера теперь требует **все** переменные окружения разом
+  (версия не наследует их от предыдущей): `YC_FOLDER_ID`, `IMAP_HOST`,
+  `SMTP_HOST`, `IMAP_USER`, `SMTP_USER`, `HELPDESK_MAILBOX`,
+  `OPERATOR_EMAIL`, `MCP_GATEWAY_URL` + секреты `IMAP_PASSWORD`/
+  `SMTP_PASSWORD` (`email-credentials`) и новые `YDB_ENDPOINT`/
+  `YDB_DATABASE` (секреты `ydb-endpoint`/`ydb-database`). SA — тот же
+  `ai-studio-sa`, роль `ydb.editor` на запись в YDB уже была выдана на
+  шаге 3 (отдельно выдавать не потребовалось). Таймаут увеличен с 30s до
+  180s — запрос с MCP-инструментом занимает больше времени (в проверке —
+  до ~9с на создание тикета, до ~24с когда агент сначала отвечает текстом
+  и затем требуется второй tool-call для `list-my-tickets`).
+- **Деплой на Windows**: в PDF команда сборки архива — `zip -j` (Unix); в
+  PowerShell аналог — `Compress-Archive` по файлам, скопированным в общую
+  временную папку (чтобы пути внутри zip были плоские, как у `zip -j`).
+- **End-to-end проверка** (2026-09-22, `director@cif-raz.ru`): письмо
+  «Создай тикет, категория bug, текст: не открывается отчёт в личном
+  кабинете» → в логах `GOT_UNSEEN=1 → MSG → REQUEST_PAYLOAD → AGENT_OK →
+  mcp_call name=create-ticket → SEND_OK`; в YDB тикет и обе реплики с
+  `ticket_id`, `model=yandexgpt/latest`, `tokens_in=515`,
+  `tokens_out=93`, `latency_ms=6293` (проверено SQL-запросом в консоли
+  YDB). Второе письмо «А какой статус у моего тикета?» — в
+  `REQUEST_PAYLOAD` видна история из двух предыдущих реплик (multi-turn),
+  сработал `list-my-tickets`. Ранее отмеченная «выдумка про ЭДО Диадок» —
+  оказалась реальным текстом из подписи отправителя, а не галлюцинацией
+  модели.
+
 ## Локальное окружение
 
 - `yc` CLI установлен, но **не в PATH** по умолчанию (путь зависит от
@@ -147,16 +226,26 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
   `*authorized_key.json` и `pg_tunnel_user`.
 - `.env.example` — шаблон переменных без значений, поддерживается в
   актуальном состоянии, отражает все переменные из `.env`.
-- `requirements.txt` — в кодировке UTF-16 (с BOM); пакет `ydb` (нужен для
-  инициализации схемы на шаге про MCP/YDB) и его зависимости. Пакет
+- `requirements.txt` (корень, для локального `.venv`) — в кодировке
+  UTF-16 (с BOM); пакет `ydb` и его зависимости. Пакет
   `yandex-ai-studio-sdk` понадобится на шаге про RAG — ещё не добавлен.
-- `src/email_poller.py` — единственный файл кода; использует только stdlib.
+- Деплойные `requirements.txt` (`src/requirements.txt`,
+  `src/ydb_tickets/requirements.txt`, обычный UTF-8, только `ydb`) — не
+  для `.venv`, а чтобы Cloud Functions runtime сам поставил зависимость
+  при сборке образа; упаковываются в zip вместе с кодом функции.
+- `src/email_poller.py`, `src/pii_mask.py` — код `email-poller`
+  (`pii_mask.py` общий с `ydb_tickets`). `src/ydb_tickets/index.py` — код
+  CF `ydb-tickets`. Компоновка деплойных zip — через `Compress-Archive`
+  из временной папки (см. раздел «Шаг 5»).
 
 ## Последний проверенный коммит
 
-`fa93ef7` («Выполнение шага 4») — на этом коммите README.md и CLAUDE.md
-сверены с состоянием проекта (2026-09-21). При следующей актуализации
-смотреть изменения `git diff fa93ef7..HEAD`.
+`0fadf10` («Выполнено 4 шага из 10») — на этом коммите README.md и
+CLAUDE.md сверены с состоянием проекта (2026-09-21). Код шага 5
+(`src/ydb_tickets/*`, `src/pii_mask.py`, `scripts/init_schema.py`,
+доработка `src/email_poller.py`) на 2026-09-22 проверен end-to-end, но
+ещё не закоммичен. При следующей актуализации смотреть изменения
+`git diff 0fadf10..HEAD`.
 
 ## Как работаем (важно)
 

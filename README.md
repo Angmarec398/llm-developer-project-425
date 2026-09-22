@@ -86,3 +86,50 @@ Timer (раз в минуту) → Cloud Function email-poller → IMAP fetch �
 ```
 GOT_UNSEEN=1 → MSG num=… from=… subject=… → AGENT_OK len=… → SEND_OK to=…
 ```
+
+### MCP-инструмент ydb-tickets и история переписки (шаг 5)
+
+Агент получил собственный MCP-инструмент для работы с тикетами и базу
+для истории диалога — обе таблицы в YDB Serverless `help-desk-db`.
+
+```
+email-poller → Responses API (+ MCP tool ydb-tickets) → YandexGPT
+                       │                                      │
+                       ▼ история/телеметрия (напрямую)         ▼ create-ticket / list-my-tickets
+                    messages                                tickets
+```
+
+- **Схема** — [src/ydb_tickets/schema.sql](src/ydb_tickets/schema.sql):
+  таблица `tickets` (тикеты, вторичный индекс `tickets_by_user`) и
+  `messages` (история переписки, `PRIMARY KEY (user_id, id)`). Применяется
+  через [scripts/init_schema.py](scripts/init_schema.py) (Python SDK) или
+  вручную в консоли YDB (вкладка Query).
+- **Cloud Function `ydb-tickets`** (код —
+  [src/ydb_tickets/index.py](src/ydb_tickets/index.py), точка входа
+  `index.handle`) отвечает на два action'а: `create-ticket` и
+  `list-my-tickets`. Понимает три контракта вызова — прямой
+  `yc serverless function invoke`, HTTP через API Gateway и вызов из MCP
+  Hub (аргументы инструмента приходят как event напрямую).
+- **MCP Hub gateway `ydb-tickets-mcp`** создан через
+  `yc serverless mcp-gateway create --tools-file src/ydb_tickets/mcp-tools.yaml`
+  ([src/ydb_tickets/mcp-tools.yaml](src/ydb_tickets/mcp-tools.yaml)), оба
+  инструмента указывают на CF `ydb-tickets`. Подключается к запросу
+  агента inline — тег `tools` в теле Responses API, с
+  `require_approval: "never"` (иначе вместо `mcp_call` приходит
+  `mcp_approval_request`, и тикет не создаётся).
+- **PII-маскирование** — [src/pii_mask.py](src/pii_mask.py), общий модуль
+  для CF `ydb-tickets` и `email-poller`: email и телефоны в тексте
+  заменяются на `[email]`/`[phone]` перед записью в YDB.
+- **История и телеметрия** — пишет `email-poller`, не агент: перед
+  вызовом LLM читает последние реплики пользователя из `messages` и
+  передаёт их в запрос (multi-turn), сохраняет входящее письмо; после
+  ответа сохраняет ответ агента с `model`, `tokens_in/out` (из `usage`
+  ответа Responses API) и `latency_ms`. Если агент вызвал `create-ticket`,
+  `ticket_id` из результата инструмента проставляется обеим репликам
+  цикла.
+- **Переменные окружения `email-poller`** (добавлены к перечисленным
+  выше): `YDB_ENDPOINT`, `YDB_DATABASE` (секреты `ydb-endpoint`/
+  `ydb-database`), `MCP_GATEWAY_URL` (SSE-адрес шлюза).
+
+Проверка: `yc serverless function invoke ydb-tickets --data '{"action":"list-my-tickets","user_id":"..."}'`
+и SQL-запрос к `messages` в консоли YDB.
