@@ -1,0 +1,102 @@
+# daily-escalation: раз в сутки находит тикеты, открытые дольше 24 часов,
+# просит агента help-desk собрать по ним дайджест, помечает их escalated и
+# отправляет дайджест оператору письмом через CF email-sender.
+#
+# Синтаксис — YaWL 0.1 для интерфейса Yandex Cloud (деплоим через
+# `yc serverless workflow create --yaml-spec`), поэтому шаблоны — jq-строчная
+# интерполяция \( ... ), а не {{ ... }} (последнее — только для workflow,
+# созданных в интерфейсе AI Studio) и не ${...}. Поле `next` — часть тела
+# каждого шага (databaseQuery/aiStudioAgent/httpCall), а не его сосед.
+#
+# Результат шага сливается прямо в корень состояния workflow (не под
+# .<имя_шага> — это не задокументировано, подобрано опытным путём через
+# execution get): databaseQuery в режиме QUERY кладёт ResultSets (массив
+# массивов строк, по одному на statement), в режиме EXEC — RowsAffected;
+# aiStudioAgent кладёт текст ответа в Result.
+#
+# promptTemplateId — НЕ id агента из каталога Agent Atelier (aac...), с ним
+# aiStudioAgent падает 404 на ai.api.cloud.yandex.net (та же ловушка, что и
+# в email_poller.py с agent_id на шаге 4). Нужен отдельный ресурс "Prompt" —
+# создаётся в консоли AI Studio в разделе Responses API, id вида fvt...
+
+yawl: "0.1"
+start: select_overdue
+
+defaultRetryPolicy:
+  errorList:
+    - STEP_TIMEOUT
+    - HTTP_CALL_502
+    - HTTP_CALL_503
+    - HTTP_CALL_504
+    - DATABASE_QUERY_UNAVAILABLE
+    - DATABASE_QUERY_CONNECTION_FAILED
+  errorListMode: INCLUDE
+  initialDelay: 2s
+  maxDelay: 30s
+  retryCount: 3
+
+steps:
+  select_overdue:
+    databaseQuery:
+      connection:
+        type: YDB
+        host: ydb.serverless.yandexcloud.net
+        port: 2135
+        database: /ru-central1/b1g46i6gi5dt7s5etbvj/etnieql31k4tpuj4hc0f
+        ssl: true
+        iam: true
+      query: >-
+        SELECT id, category, text, created_at FROM tickets
+        WHERE status = 'open' AND created_at < CurrentUtcTimestamp() - Interval('PT24H');
+      mode: QUERY
+      next: check_overdue
+
+  check_overdue:
+    switch:
+      choices:
+        - condition: .ResultSets[0] | length > 0
+          next: build_digest
+        # у switch нет default — catch-all вместо него
+        - condition: "true"
+          next: done
+
+  build_digest:
+    aiStudioAgent:
+      promptTemplateId: fvtf88gq0nh9u2rrk3s2
+      message: >-
+        Ты формируешь дайджест для оператора службы поддержки по тикетам,
+        которые открыты дольше 24 часов и требуют внимания. Список тикетов
+        в формате JSON (поля id, category, text, created_at):
+        \(.ResultSets[0] | tojson)
+        Для каждого тикета выведи отдельным пунктом id, категорию и краткую
+        суть обращения (1-2 предложения). В конце укажи общее количество
+        тикетов. Ответь простым текстом, без markdown-разметки.
+      autoApprove: false
+      next: mark_escalated
+
+  mark_escalated:
+    databaseQuery:
+      connection:
+        type: YDB
+        host: ydb.serverless.yandexcloud.net
+        port: 2135
+        database: /ru-central1/b1g46i6gi5dt7s5etbvj/etnieql31k4tpuj4hc0f
+        ssl: true
+        iam: true
+      query: >-
+        UPDATE tickets SET status = 'escalated', updated_at = CurrentUtcTimestamp()
+        WHERE status = 'open' AND created_at < CurrentUtcTimestamp() - Interval('PT24H');
+      mode: EXEC
+      next: send_digest
+
+  send_digest:
+    httpCall:
+      url: "https://functions.yandexcloud.net/d4et88134f3t52fli9d1"
+      method: POST
+      headers:
+        Content-Type: application/json
+      body: '\({subject: "Дайджест просроченных тикетов", body: .Result} | tojson)'
+      next: done
+
+  done:
+    success: {}

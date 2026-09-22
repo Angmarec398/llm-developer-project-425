@@ -59,8 +59,19 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
       проверено по почте (создание тикета + multi-turn история +
       PII-маскирование в логах и в YDB) — см. раздел «Шаг 5» ниже.
       Осталось: закоммитить и сдать шаг.
-- [ ] Шаг 6 и далее — RAG, авто-эскалация тикетов, безопасность (prompt
-      injection), наблюдаемость (трейсы), финальное ревью.
+- [~] Шаг 6 — авто-эскалация тикетов: workflow `daily-escalation`
+      (`docs/Шаг 6.pdf`). Workflow задеплоен, расписание выставлено,
+      ручной тест прошёл end-to-end (тикет → дайджест агентом → escalated →
+      письмо оператору), намеренный fault-injection теста (задача 7)
+      выполнен. См. раздел «Шаг 6» ниже.
+      **ВАЖНО, сделать в первую очередь при продолжении**: роль `ydb.editor`
+      у `ai-studio-sa` сейчас **отозвана** (сломали её намеренно для задачи 7
+      и не успели вернуть) — команда восстановления готова, см. конец
+      раздела «Шаг 6». Без неё сломаны и `email-poller`, и `ydb-tickets`, и
+      сам `daily-escalation` (в том числе завтрашний запуск по расписанию в
+      09:00 МСК). Дальше — закоммитить и сдать шаг.
+- [ ] Шаг 7 и далее — RAG, безопасность (prompt injection), наблюдаемость
+      (трейсы), финальное ревью.
 
 Формулировки задач каждого шага — в `docs/Шаг N.pdf`. Общий контекст и
 критерии сдачи проекта — в `docs/Общие данные.pdf`.
@@ -78,7 +89,12 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
   - `YDB_DATABASE=/ru-central1/b1g46i6gi5dt7s5etbvj/etnieql31k4tpuj4hc0f`
 - Сервисный аккаунт `ai-studio-sa` (`SA_ID=ajeot9iv90eij6tloqo0`), роли на
   каталоге: `functions.functionInvoker`, `serverless.mcpGateways.invoker`,
-  `lockbox.payloadViewer`, `ai.languageModels.user`, `ydb.editor`.
+  `lockbox.payloadViewer`, `ai.languageModels.user`, `ai.assistants.editor`
+  (добавлена на шаге 6, нужна шагу `aiStudioAgent`). **`ydb.editor` сейчас
+  отсутствует** — отозвана намеренно для fault-injection теста на шаге 6
+  (задача 7) и ещё не возвращена, см. чек-лист «Прогресс по шагам» и раздел
+  «Шаг 6». Восстановить:
+  `yc resource-manager folder add-access-binding --id b1gtltvclf9uth3u1r37 --service-account-id ajeot9iv90eij6tloqo0 --role "ydb.editor"`.
 - Секреты в Lockbox (ключ payload везде называется `PAYLOAD_KEY`):
   | Секрет | secret_id | version_id |
   |---|---|---|
@@ -207,6 +223,81 @@ Hub, деплой через Cloud Functions и Yandex Workflows, секреты
   сработал `list-my-tickets`. Ранее отмеченная «выдумка про ЭДО Диадок» —
   оказалась реальным текстом из подписи отправителя, а не галлюцинацией
   модели.
+
+## Шаг 6: workflow daily-escalation (текущее состояние)
+
+- **Cloud Function `email-sender`** (`function_id=d4et88134f3t52fli9d1`, код
+  — `src/email_sender.py`, точка входа `email_sender.handle`). Тонкая
+  обёртка над SMTP (тот же ящик Reg.ru, что у `email-poller`): принимает
+  `{subject, body}` через `httpCall`, шлёт на `OPERATOR_EMAIL` из своего
+  окружения (не из тела запроса — иначе публичный URL можно превратить в
+  рассылку на произвольный адрес). Открыта на неаутентифицированный вызов
+  (`yc serverless function allow-unauthenticated-invoke`) — YaWL `httpCall`
+  не шлёт IAM-токен. Переменные: `SMTP_HOST=mail.hosting.reg.ru`,
+  `SMTP_USER=helpdesk_hexlet@cif-raz.ru`,
+  `HELPDESK_MAILBOX=helpdesk_hexlet@cif-raz.ru`,
+  `OPERATOR_EMAIL=director@cif-raz.ru`, секрet `SMTP_PASSWORD` из того же
+  `email-credentials`. SA — `ai-studio-sa`. Проверена прямым HTTP-вызовом
+  до подключения к workflow — письмо дошло.
+- **Workflow `daily-escalation`** (`id=dfq9949uhkq7c1hae9lb`), спецификация
+  — `src/workflow.yaml`, SA — `ai-studio-sa`. Граф: `select_overdue`
+  (databaseQuery SELECT) → `check_overdue` (switch) → `build_digest`
+  (aiStudioAgent) → `mark_escalated` (databaseQuery UPDATE) → `send_digest`
+  (httpCall → `email-sender`) → `done`.
+- **Как реально передаются данные между шагами (не задокументировано,
+  подобрано через `execution get`)**: результат шага сливается прямо в
+  корень состояния workflow, а не под `.<имя_шага>`. `databaseQuery` в
+  режиме `QUERY` кладёt `ResultSets` (массив массивов строк — по одному
+  результату на statement, у нас всегда один SELECT → `.ResultSets[0]`); в
+  режиме `EXEC` — `RowsAffected`/`LastInsertId`. `aiStudioAgent` кладёт
+  текст ответа в `Result` (с большой буквы).
+- **`promptTemplateId` в `aiStudioAgent` — НЕ `agent_id` из каталога Agent
+  Atelier.** С `aactljdp4006i2nut1qo` (наш агент `help-desk`) шаг падает
+  `404 not found` на `https://ai.api.cloud.yandex.net/v1/responses` — та же
+  ловушка, что и с `agent_id`/`prompt.id` в `email_poller.py` на шаге 4.
+  Agent Atelier не отдаёт ID, пригодный для прямых вызовов API (кнопка
+  «Опубликовать» там предлагает только Telegram/Телемост/MAX/виджет для
+  сайта, никакого API). Нужен отдельный ресурс — создаётся в консоли AI
+  Studio в разделе **Responses API** («создать нового агента» там же), ID
+  вида `fvt...`. Для дайджеста создан `promptTemplateId=fvtf88gq0nh9u2rrk3s2`
+  — пустой промпт, все инструкции передаются целиком через `message` шага
+  (текст задачи + `\(.ResultSets[0] | tojson)` со списком тикетов).
+- **Синтаксис шаблонов**: YaWL для интерфейса Yandex Cloud (`yc serverless
+  workflow create/update --yaml-spec`) использует jq-интерполяцию
+  `\( .field )` — `{{ .field }}` (эту форму находили в примерах доков)
+  относится только к workflow, созданным в интерфейсе AI Studio, а не через
+  `yc`. `condition` в `switch` — исключение, это всегда «голое» jq-выражение
+  без `\( )` (`condition: .ResultSets[0] | length > 0`).
+- **JSON-схема YaWL 0.1** —
+  `https://raw.githubusercontent.com/yandex-cloud/json-schema-store/refs/heads/master/serverless/workflows/yawl.json`,
+  ей можно валидировать `src/workflow.yaml` локально (`jsonschema` +
+  `pyyaml` в Python) до деплоя — так и делали при отладке.
+- **`yc serverless workflow update --schedule-timezone Europe/Moscow`**
+  падает с `ERROR: Invalid timezone` (похоже на баг/ограничение этой версии
+  CLI — именованные таймзоны не принимаются, хотя `--help` их и предлагает
+  как пример). Без флага расписание встаёт в `UTC`. Cron — не Quartz: символ
+  `?` в `dow`/`dom` не поддерживается (`Invalid expression: ?`), «каждый
+  день» пишется просто `*` в обоих полях. Итоговое расписание — cron
+  `0 6 * * * *` (UTC) = 09:00 по Москве, без флага `--schedule-timezone`.
+- **Права workflow** (отдельно от ролей на каталоге): SA `ai-studio-sa`
+  через `yc serverless workflow add-access-binding --name daily-escalation`
+  получил `serverless.workflows.executor` и `serverless.workflows.viewer` —
+  без них падал бы scheduled-trigger (для ручных `execution start`/`get` из
+  CLI эти роли не требовались — там действует IAM-сессия самого `yc`, не SA
+  workflow'а).
+- **Ручной тест** (2026-09-22, порог временно `PT1H` вместо `PT24H`): первая
+  прогонка ушла в `done` за 1.5с, не дойдя до агента — ловили путь
+  `.select_overdue.rows` вместо `.ResultSets[0]` (см. выше). После правки —
+  дошло до письма; в debug-версии тело письма содержало весь стейт целиком,
+  из него и вычитали `Result`. Оба тестовых тикета (созданные на шаге 5)
+  ушли в `escalated`. Порог возвращён на `PT24H`.
+- **Fault-injection тест** (задача 7 PDF, 2026-09-22): временно отозвали
+  `ydb.editor` у `ai-studio-sa`, запустили execution — `execution get`
+  показал `error_code: DATABASE_QUERY_CONNECTION_FAILED`, в `message`
+  явно видно `PermissionDenied`; заодно подтвердилось, что `retryPolicy`
+  реально повторяет попытки (~25с вместо мгновенного отказа — 3 попытки с
+  задержками). **Роль ещё не восстановлена** — см. «Прогресс по шагам» и
+  «Облачные ресурсы» выше, команда возврата там же.
 
 ## Локальное окружение
 
