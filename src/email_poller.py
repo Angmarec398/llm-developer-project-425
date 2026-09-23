@@ -13,6 +13,7 @@ import functools
 import imaplib
 import json
 import os
+import re
 import smtplib
 import time
 import urllib.error
@@ -48,22 +49,75 @@ MODEL = os.environ.get("MODEL", "yandexgpt/latest")
 YDB_ENDPOINT = os.environ.get("YDB_ENDPOINT", "")
 YDB_DATABASE = os.environ.get("YDB_DATABASE", "")
 MCP_GATEWAY_URL = os.environ.get("MCP_GATEWAY_URL", "")
+SEARCH_INDEX_ID = os.environ.get("SEARCH_INDEX_ID", "")
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "10"))
 
 SYSTEM_PROMPT = (
     "Ты — Help Desk-агент службы поддержки. Отвечай сотруднику вежливо и кратко, "
-    "на языке обращения. Если не знаешь ответа — честно скажи об этом.\n\n"
-    "У тебя есть два инструмента:\n"
+    "на языке обращения.\n\n"
+    "У тебя есть три инструмента:\n"
+    "- file_search — база знаний компании (HR, IT, администрирование). ВСЕГДА "
+    "обращайся к ней перед ответом на содержательный вопрос, даже если тебе "
+    "кажется, что ты уже знаешь ответ. Используй ТОЛЬКО факты, которые "
+    "буквально есть в найденном документе: цифры, сроки, проценты, номера "
+    "законов, шаги решения проблемы, рекомендации и т.п. НЕ добавляй из "
+    "своих общих знаний, даже если они кажутся тебе верными или логичными "
+    "— если документ не описывает какой-то шаг или совет, не придумывай "
+    "его сам. Не превращай короткое объяснение из документа в развёрнутую "
+    "инструкцию из нескольких пунктов, если в документе её не было — "
+    "лучше короткий ответ строго по документу, чем длинный, но частично "
+    "выдуманный. Отвечай кратко своими словами, не цитируй больше 2-3 "
+    "предложений; указывать имя файла-источника не нужно — это делает "
+    "система автоматически по тексту твоего ответа.\n"
     "- create-ticket(user_id, category, text) — заводи тикет, если сотрудник явно "
-    "просит создать заявку/тикет, либо если ты не можешь помочь сам и обращение "
-    "нужно передать оператору. category — одно из: bug, docs, feature, access. "
-    "Не заводи повторный тикет на один и тот же вопрос в рамках одного диалога.\n"
+    "просит создать заявку/тикет, либо если file_search не дал релевантного "
+    "ответа на содержательный вопрос. Во втором случае вызови create-ticket "
+    "СРАЗУ, без уточняющего вопроса «создать ли тикет» — сотрудник ждёт "
+    "результата, а не диалога. После вызова инструмента честно скажи «не "
+    "знаю» и сообщи, что создал тикет (укажи его номер), чтобы оператор "
+    "разобрался; никогда не придумывай ответ вместо этого. category — одно "
+    "из: bug, docs, feature, access. Не заводи повторный тикет на один и "
+    "тот же вопрос в рамках одного диалога.\n"
     "- list-my-tickets(user_id) — вызывай, если сотрудник спрашивает статус своих "
     "ранее созданных заявок или просит их список.\n"
-    "Для обоих инструментов user_id — email отправителя, он указан ниже."
+    "Для create-ticket и list-my-tickets user_id — email отправителя, он указан ниже."
 )
 
 MAX_BODY_CHARS = 8000
+
+_WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+
+
+def _load_kb_docs() -> dict[str, str]:
+    # Локальная копия корпуса (упакована в zip рядом с кодом) — источник
+    # правды для сопоставления ответа с документом. API-поля file_search
+    # (results/annotations) оказались недостоверными: перечисляют все
+    # файлы индекса без реальной привязки к конкретной цитате (см. CLAUDE.md,
+    # раздел «Шаг 7»), поэтому определяем источник сами по тексту ответа.
+    kb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_base")
+    docs = {}
+    if os.path.isdir(kb_dir):
+        for name in sorted(os.listdir(kb_dir)):
+            if name.endswith(".md"):
+                with open(os.path.join(kb_dir, name), encoding="utf-8") as f:
+                    docs[name] = f.read()
+    return docs
+
+
+_KB_DOCS = _load_kb_docs()
+
+
+def _best_matching_doc(answer: str) -> str | None:
+    answer_words = {w.lower() for w in _WORD_RE.findall(answer) if len(w) > 3}
+    if not answer_words:
+        return None
+    best_name, best_score = None, 0
+    for name, text in _KB_DOCS.items():
+        doc_words = {w.lower() for w in _WORD_RE.findall(text) if len(w) > 3}
+        score = len(answer_words & doc_words)
+        if score > best_score:
+            best_name, best_score = name, score
+    return best_name if best_score >= 3 else None
 
 _driver = None
 _pool = None
@@ -221,11 +275,15 @@ def _ask_agent(text: str, history: list[dict], sender: str, token: str) -> dict:
         "input": input_messages,
         "tools": [
             {
+                "type": "file_search",
+                "vector_store_ids": [SEARCH_INDEX_ID],
+            },
+            {
                 "type": "mcp",
                 "server_label": "ydb-tickets",
                 "server_url": MCP_GATEWAY_URL,
                 "require_approval": "never",
-            }
+            },
         ],
     }
     print(f"REQUEST_PAYLOAD={json.dumps(body, ensure_ascii=False)[:2000]}")
@@ -274,6 +332,18 @@ def _extract_ticket_id(data: dict) -> str | None:
         if ticket_id:
             return ticket_id
     return None
+
+
+def _log_file_search_calls(data: dict) -> bool:
+    called = False
+    for item in data.get("output", []) or []:
+        if item.get("type") != "file_search_call":
+            continue
+        called = True
+        results = item.get("results") or []
+        found = [r.get("filename") or r.get("file_id") for r in results]
+        print(f"file_search_call queries={item.get('queries')} results={found}")
+    return called
 
 
 def _send_reply(to_addr: str, subject: str, text: str, in_reply_to: str | None) -> None:
@@ -346,6 +416,12 @@ def handle(event, context):
                     raise RuntimeError("empty agent answer")
 
                 usage = response.get("usage", {}) or {}
+                used_file_search = _log_file_search_calls(response)
+                if used_file_search:
+                    source = _best_matching_doc(answer)
+                    print(f"source_match={source}")
+                    if source:
+                        answer = f"{answer}\n\nИсточник: {source}"
                 ticket_id = _extract_ticket_id(response)
 
                 _insert_message(

@@ -133,3 +133,88 @@ email-poller → Responses API (+ MCP tool ydb-tickets) → YandexGPT
 
 Проверка: `yc serverless function invoke ydb-tickets --data '{"action":"list-my-tickets","user_id":"..."}'`
 и SQL-запрос к `messages` в консоли YDB.
+
+### Авто-эскалация тикетов: workflow daily-escalation (шаг 6)
+
+Раз в сутки по расписанию собирает просроченные открытые тикеты, просит
+агента составить дайджест, переводит их в `escalated` и отправляет письмо
+оператору — без участия email-poller.
+
+```
+Cron 06:00 UTC → select_overdue (SELECT) → check_overdue (switch)
+              → build_digest (aiStudioAgent) → mark_escalated (UPDATE)
+              → send_digest (httpCall → email-sender) → done
+```
+
+- **Спецификация** — [src/workflow.yaml](src/workflow.yaml) (YaWL),
+  workflow `daily-escalation`, сервисный аккаунт — `ai-studio-sa`.
+- **Cloud Function `email-sender`** ([src/email_sender.py](src/email_sender.py),
+  точка входа `email_sender.handle`) — тонкая обёртка над SMTP, шлёт
+  письмо на `OPERATOR_EMAIL` из своего окружения (не из тела запроса).
+  Открыта на неаутентифицированный вызов — шаг `httpCall` в YaWL не
+  передаёт IAM-токен.
+- **`build_digest`** — не агент из Agent Atelier (`agent_id`, как в
+  email-poller), а отдельный ресурс **Responses API** из консоли AI
+  Studio (`promptTemplateId`, вида `fvt...`); промпт пустой, все
+  инструкции передаются через `message` самого шага workflow.
+- **Расписание** — cron 6 полей (`секунды минуты часы день месяц
+  день-недели`), `0 0 6 * * *` = 06:00 UTC (09:00 МСК) ежедневно; символ
+  `?` не поддерживается (не Quartz), «каждый день» — просто `*`.
+- **Права workflow** — отдельно от ролей на каталоге:
+  `yc serverless workflow add-access-binding` выдаёт SA
+  `serverless.workflows.executor`/`viewer`, без них не сработает
+  scheduled-trigger.
+
+Проверка: `yc serverless workflow execution list --workflow-name
+daily-escalation` и SQL `SELECT status, count(*) FROM tickets GROUP BY
+status` в консоли YDB (эскалированные тикеты больше не попадают в
+выборку — `select_overdue`/`mark_escalated` фильтруют `WHERE status =
+'open'`).
+
+### Подключение RAG: file_search (шаг 7)
+
+Перед ответом агент ищет релевантные документы в корпоративной базе
+знаний через `file_search`; если ответа нет — честно говорит «не знаю» и
+сразу заводит тикет через уже существующий MCP-инструмент `ydb-tickets`.
+
+```
+вопрос → email-poller → Responses API (+ file_search, + MCP ydb-tickets)
+              │                              │
+              ▼ найден документ              ▼ не найдено
+      ответ с цитатой и ссылкой      «не знаю» + create-ticket
+```
+
+- **Корпус** — [knowledge_base/](knowledge_base) (9 markdown-документов,
+  HR/IT/администрирование), загружен в один search index через CLI
+  `yandex-ai-studio vector-stores local` (пакет `yandex-ai-studio-sdk`).
+  Один индекс — не по темам, т.к. Yandex Responses API поддерживает
+  только один `vector_store_id` и один `file_search` tool за раз.
+- **Подключение** — в [src/email_poller.py](src/email_poller.py) в
+  `tools` добавлен `{"type": "file_search", "vector_store_ids":
+  [SEARCH_INDEX_ID]}` рядом с MCP-инструментом; `SEARCH_INDEX_ID` —
+  новая переменная окружения функции.
+- **Промпт** — явно требует всегда обращаться к `file_search` перед
+  содержательным ответом и использовать только факты из найденного
+  документа; если ничего не найдено — вызвать `create-ticket` сразу, без
+  уточняющего вопроса, и лишь затем сообщить «не знаю» с номером тикета.
+- **Источник ответа** определяется не моделью, а кодом: `knowledge_base/`
+  упакован в тот же zip, что и код функции, и `email-poller` сам
+  сопоставляет текст ответа с документами корпуса (пересечение слов) —
+  поля `results`/`annotations`, которые возвращает `file_search` в
+  Responses API, оказались недостоверны (перечисляют вообще все файлы
+  индекса, а не то, что реально процитировано).
+- **Трейс** — `output[].type=="file_search_call"` (поля `queries`,
+  `results`) логируется так же, как `mcp_call`.
+
+Проверка: вопрос из базы знаний → в логах `file_search_call`, в ответе —
+строка `Источник: <файл>`. Вопрос вне базы → «не знаю» + новый тикет,
+видно через `yc serverless function invoke ydb-tickets --data
+'{"action":"list-my-tickets","user_id":"..."}'`.
+
+**Известное ограничение**: модель `yandexgpt/latest` не всегда надёжно
+следует инструкциям промпта — иногда пропускает вызов `file_search` для
+вопроса, явно покрытого базой знаний, иногда подмешивает в ответ факты,
+которых нет в найденном документе. Сам RAG-контур (индекс, инструмент,
+определение источника) на чистых тестах работает корректно; ненадёжность
+— в инструкционной дисциплине модели, а не в реализации. Подробности и
+конкретные примеры — в CLAUDE.md, раздел «Шаг 7».
