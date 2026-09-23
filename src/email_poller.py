@@ -88,6 +88,14 @@ MAX_BODY_CHARS = 8000
 _WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
 
 
+def _mask_for_log(value) -> str:
+    # Для логов CF: сериализуем как есть и прогоняем через mask_pii, чтобы
+    # не логировать сырой email/телефон/номер карты из текста обращения,
+    # истории переписки или аргументов инструмента (см. CLAUDE.md, шаг 8).
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return mask_pii(text)
+
+
 def _load_kb_docs() -> dict[str, str]:
     # Локальная копия корпуса (упакована в zip рядом с кодом) — источник
     # правды для сопоставления ответа с документом. API-поля file_search
@@ -286,7 +294,7 @@ def _ask_agent(text: str, history: list[dict], sender: str, token: str) -> dict:
             },
         ],
     }
-    print(f"REQUEST_PAYLOAD={json.dumps(body, ensure_ascii=False)[:2000]}")
+    print(f"REQUEST_PAYLOAD={_mask_for_log(body)[:2000]}")
 
     req = urllib.request.Request(
         RESPONSES_URL,
@@ -321,7 +329,7 @@ def _extract_ticket_id(data: dict) -> str | None:
     for item in data.get("output", []) or []:
         if item.get("type") != "mcp_call":
             continue
-        print(f"mcp_call name={item.get('name')} args={item.get('arguments')}")
+        print(f"mcp_call name={item.get('name')} args={_mask_for_log(item.get('arguments'))}")
         if item.get("name") != "create-ticket":
             continue
         try:
@@ -342,7 +350,7 @@ def _log_file_search_calls(data: dict) -> bool:
         called = True
         results = item.get("results") or []
         found = [r.get("filename") or r.get("file_id") for r in results]
-        print(f"file_search_call queries={item.get('queries')} results={found}")
+        print(f"file_search_call queries={_mask_for_log(item.get('queries'))} results={found}")
     return called
 
 
@@ -388,7 +396,7 @@ def handle(event, context):
                 msg = email.message_from_bytes(fetched[0][1], policy=email.policy.default)
                 sender = parseaddr(msg.get("From", ""))[1]
                 subject = str(msg.get("Subject", "")) or "(без темы)"
-                print(f"MSG num={num.decode()} from={sender} subject={subject}")
+                print(f"MSG num={num.decode()} from={sender} subject={mask_pii(subject)}")
 
                 # Не отвечаем самим себе и автоответам — иначе почтовая петля.
                 auto = str(msg.get("Auto-Submitted", "no")).lower() != "no"
@@ -443,7 +451,7 @@ def handle(event, context):
                 processed += 1
             except Exception as exc:  # noqa: BLE001
                 errors += 1
-                print(f"MSG_FAIL num={num.decode()} err={exc!r}")
+                print(f"MSG_FAIL num={num.decode()} err={mask_pii(repr(exc))}")
             finally:
                 _imap_mark_seen(imap, num)
     finally:
