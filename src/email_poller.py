@@ -116,16 +116,24 @@ _KB_DOCS = _load_kb_docs()
 
 
 def _best_matching_doc(answer: str) -> str | None:
+    # Порог намеренно строгий (абсолютный минимум + явный отрыв от второго
+    # места): ответ может формально пройти file_search, но по факту не
+    # содержать фактов ни из одного документа (например, вежливый отказ
+    # или «тикет уже создан») — в этом случае лучше не показывать источник
+    # вовсе, чем приписать случайно набравший пересечение документ.
     answer_words = {w.lower() for w in _WORD_RE.findall(answer) if len(w) > 3}
     if not answer_words:
         return None
-    best_name, best_score = None, 0
+    scores = []
     for name, text in _KB_DOCS.items():
         doc_words = {w.lower() for w in _WORD_RE.findall(text) if len(w) > 3}
-        score = len(answer_words & doc_words)
-        if score > best_score:
-            best_name, best_score = name, score
-    return best_name if best_score >= 3 else None
+        scores.append((len(answer_words & doc_words), name))
+    scores.sort(reverse=True)
+    best_score, best_name = scores[0]
+    second_score = scores[1][0] if len(scores) > 1 else 0
+    if best_score < 6 or best_score < second_score * 2:
+        return None
+    return best_name
 
 _driver = None
 _pool = None
@@ -421,7 +429,15 @@ def handle(event, context):
                 answer = _extract_output_text(response)
                 print(f"AGENT_OK len={len(answer)}")
                 if not answer:
-                    raise RuntimeError("empty agent answer")
+                    incomplete_reason = (response.get("incomplete_details") or {}).get("reason")
+                    if not incomplete_reason:
+                        raise RuntimeError("empty agent answer")
+                    print(f"CONTENT_FILTER_BLOCKED reason={incomplete_reason}")
+                    answer = (
+                        "Не могу обработать это обращение — запрос заблокирован "
+                        "фильтром безопасности. Если это ошибка, опишите проблему "
+                        "другими словами или обратитесь к оператору напрямую."
+                    )
 
                 usage = response.get("usage", {}) or {}
                 used_file_search = _log_file_search_calls(response)
