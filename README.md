@@ -8,6 +8,168 @@ Help Desk-агент: принимает обращения сотруднико
 и сохраняет переписку в YDB. Работает внутри контура Yandex Cloud
 (YandexGPT + AI Studio, YDB Serverless, Cloud Functions, Yandex Workflows).
 
+### Развёртывание с нуля (~15 минут)
+
+Предполагается, что `yc` CLI уже установлен и авторизован (`yc init`), и
+выбран каталог по умолчанию (`yc config get folder-id`). Имена ресурсов и
+переменных ниже совпадают с `.env.example` и кодом в `src/`; секреты
+(пароль почты) вводятся руками в консоли/CLI, а не хранятся в репозитории.
+
+**0. Клонировать репозиторий и подготовить `.env`**
+
+```bash
+git clone <URL_РЕПОЗИТОРИЯ>
+cd llm-developer-project-425
+cp .env.example .env   # заполняется значениями по ходу шагов ниже
+```
+
+**1. Сервисный аккаунт и роли на каталоге**
+
+```bash
+yc iam service-account create --name ai-studio-sa
+SA_ID=$(yc iam service-account get ai-studio-sa --format json | jq -r .id)
+FOLDER_ID=$(yc config get folder-id)
+
+for role in functions.functionInvoker serverless.mcpGateways.invoker \
+            lockbox.payloadViewer ai.languageModels.user ydb.editor \
+            serverless.workflows.executor serverless.workflows.viewer; do
+  yc resource-manager folder add-access-binding "$FOLDER_ID" \
+    --role "$role" --subject "serviceAccount:$SA_ID"
+done
+```
+
+**2. YDB Serverless + схема таблиц**
+
+```bash
+yc ydb database create help-desk-db --serverless --location-id ru-central1
+yc ydb database get help-desk-db   # взять endpoint и database path в .env
+
+export YDB_ENDPOINT=grpcs://ydb.serverless.yandexcloud.net:2135
+export YDB_DATABASE=/ru-central1/<cloud-id>/<database-id>
+export YC_IAM_TOKEN=$(yc iam create-token)
+python scripts/init_schema.py   # применяет src/ydb_tickets/schema.sql
+```
+
+**3. Секреты в Lockbox**
+
+```bash
+yc lockbox secret create --name ydb-endpoint \
+  --payload '[{key: PAYLOAD_KEY, text_value: "'"$YDB_ENDPOINT"'"}]'
+yc lockbox secret create --name ydb-database \
+  --payload '[{key: PAYLOAD_KEY, text_value: "'"$YDB_DATABASE"'"}]'
+yc lockbox secret create --name email-credentials \
+  --payload '[{key: email_password, text_value: "<ПАРОЛЬ_ПОЧТОВОГО_ЯЩИКА>"}]'
+```
+
+Сохрани `id`/`version-id` каждого секрета из вывода команд — они нужны при
+деплое функций (флаг `--secret`).
+
+**4. Поисковый индекс RAG (`file_search`)**
+
+```bash
+pip install yandex-ai-studio-sdk
+export YC_IAM_TOKEN=$(yc iam create-token)
+yandex-ai-studio vector-stores local create \
+  --name help-desk-kb --folder-id "$FOLDER_ID" \
+  knowledge_base/admin-meeting-room.md knowledge_base/admin-propusk.md \
+  knowledge_base/admin-stationery.md knowledge_base/hr-bolnichny.md \
+  knowledge_base/hr-komandirovka.md knowledge_base/hr-otpusk.md \
+  knowledge_base/it-equipment.md knowledge_base/it-password-reset.md \
+  knowledge_base/it-vpn.md
+# сохранить search_index_id → SEARCH_INDEX_ID в .env
+```
+
+**5. Cloud Function `ydb-tickets` + MCP-шлюз**
+
+```bash
+mkdir -p /tmp/ydb-tickets && cp src/ydb_tickets/index.py \
+  src/ydb_tickets/schema.sql src/ydb_tickets/requirements.txt \
+  src/pii_mask.py /tmp/ydb-tickets/
+(cd /tmp/ydb-tickets && zip -j ../ydb-tickets.zip *)
+
+yc serverless function create --name ydb-tickets
+yc serverless function version create \
+  --function-name ydb-tickets --runtime python312 \
+  --entrypoint index.handle --memory 128m --execution-timeout 60s \
+  --service-account-id "$SA_ID" --source-path /tmp/ydb-tickets.zip \
+  --environment YC_FOLDER_ID="$FOLDER_ID" \
+  --secret environment-variable=YDB_ENDPOINT,id=<SECRET_ID_ydb-endpoint>,version-id=<VERSION_ID>,key=PAYLOAD_KEY \
+  --secret environment-variable=YDB_DATABASE,id=<SECRET_ID_ydb-database>,version-id=<VERSION_ID>,key=PAYLOAD_KEY
+
+yc serverless mcp-gateway create --name ydb-tickets-mcp \
+  --tools-file src/ydb_tickets/mcp-tools.yaml
+# SSE-адрес из вывода команды → MCP_GATEWAY_URL в .env
+```
+
+**6. Cloud Function `email-poller`**
+
+```bash
+mkdir -p /tmp/email-poller && cp src/email_poller.py src/pii_mask.py \
+  src/requirements.txt /tmp/email-poller/
+cp -r knowledge_base /tmp/email-poller/
+(cd /tmp/email-poller && zip -jr ../email-poller.zip . )
+# (knowledge_base — подпапкой, поэтому zip без -j для неё же;
+# на Windows — Compress-Archive из общей временной папки, см. CLAUDE.md)
+
+yc serverless function create --name email-poller
+yc serverless function version create \
+  --function-name email-poller --runtime python312 \
+  --entrypoint email_poller.handle --memory 128m --execution-timeout 180s \
+  --service-account-id "$SA_ID" --source-path /tmp/email-poller.zip \
+  --environment YC_FOLDER_ID="$FOLDER_ID",IMAP_HOST=mail.hosting.reg.ru,SMTP_HOST=mail.hosting.reg.ru,IMAP_USER=<ЯЩИК>,SMTP_USER=<ЯЩИК>,HELPDESK_MAILBOX=<ЯЩИК>,OPERATOR_EMAIL=<EMAIL_ОПЕРАТОРА>,MCP_GATEWAY_URL=<SSE_АДРЕС_ИЗ_ШАГА_5>,SEARCH_INDEX_ID=<ИЗ_ШАГА_4> \
+  --secret environment-variable=YDB_ENDPOINT,id=<SECRET_ID>,version-id=<VERSION_ID>,key=PAYLOAD_KEY \
+  --secret environment-variable=YDB_DATABASE,id=<SECRET_ID>,version-id=<VERSION_ID>,key=PAYLOAD_KEY \
+  --secret environment-variable=IMAP_PASSWORD,id=<SECRET_ID_email-credentials>,version-id=<VERSION_ID>,key=email_password \
+  --secret environment-variable=SMTP_PASSWORD,id=<SECRET_ID_email-credentials>,version-id=<VERSION_ID>,key=email_password
+
+yc serverless trigger create timer --name email-poller-trigger \
+  --cron-expression '0/1 * * * ? *' \
+  --invoke-function-name email-poller \
+  --invoke-function-service-account-id "$SA_ID"
+```
+
+**7. Cloud Function `email-sender` (для авто-эскалации)**
+
+```bash
+yc serverless function create --name email-sender
+zip -j /tmp/email-sender.zip src/email_sender.py
+
+yc serverless function version create \
+  --function-name email-sender --runtime python312 \
+  --entrypoint email_sender.handle --memory 128m --execution-timeout 30s \
+  --service-account-id "$SA_ID" --source-path /tmp/email-sender.zip \
+  --environment SMTP_HOST=mail.hosting.reg.ru,SMTP_USER=<ЯЩИК>,HELPDESK_MAILBOX=<ЯЩИК>,OPERATOR_EMAIL=<EMAIL_ОПЕРАТОРА> \
+  --secret environment-variable=SMTP_PASSWORD,id=<SECRET_ID_email-credentials>,version-id=<VERSION_ID>,key=email_password
+
+yc serverless function allow-unauthenticated-invoke email-sender
+```
+
+**8. Workflow `daily-escalation`**
+
+```bash
+yc serverless workflow create --name daily-escalation \
+  --yaml-spec src/workflow.yaml \
+  --service-account-id "$SA_ID" \
+  --schedule '0 0 6 * * *'   # 06:00 UTC = 09:00 МСК ежедневно (без --schedule-timezone, см. известный баг CLI в CLAUDE.md)
+
+yc serverless workflow add-access-binding --name daily-escalation \
+  --role serverless.workflows.executor --subject "serviceAccount:$SA_ID"
+yc serverless workflow add-access-binding --name daily-escalation \
+  --role serverless.workflows.viewer --subject "serviceAccount:$SA_ID"
+```
+
+**9. Проверка**
+
+Письмо на Help Desk-ящик (см. «Что попробовать» ниже) → ответ приходит в
+течение ~60 секунд → запись видна в YDB (`SELECT * FROM messages` в
+консоли) → на следующий день (или ручным `workflow execution start`)
+просроченный тикет уходит в дайджест оператору.
+
+> Точные значения флагов (`--memory`, `--execution-timeout`, названия
+> переменных) соответствуют тому, что реально задеплоено в этом проекте
+> (см. также `CLAUDE.md`); при расхождении с версией `yc` CLI на твоей
+> машине — сверяйся с `--help` конкретной подкоманды.
+
 ### Окружение (шаг 2)
 
 - Каталог Yandex Cloud: `folder-id` — см. `yc config get folder-id`.
@@ -410,10 +572,6 @@ Desk-ящик):
   сработал на явной инъекции раньше, чем до `create-ticket` вообще дошло
   дело; `email-poller` теперь корректно обрабатывает такой ответ вежливым
   отказом вместо падения с необработанным исключением.
-- **Определение источника ответа** (`Источник: <файл>`) — эвристика на
-  пересечении слов, не гарантия: при отсутствии релевантного совпадения
-  теперь ничего не показывает (исправлено на шаге 9), но остаётся
-  приближённой оценкой, а не настоящей цитатой.
 - **Вопрос вне базы знаний** — по факту агент вежливо отказывает и не
   предлагает создать тикет (отличается от буквального примера в задании
   шага 9, где ожидался тикет); осознанно оставлено как есть — для явно
