@@ -385,6 +385,7 @@ Desk-ящик):
 | [`screen/question 2.png`](screen/question%202.png) | Письмо-уточнение в том же треде: «Не помогло, создай тикет категория bug» |
 | [`screen/answer 2.png`](screen/answer%202.png) | Ответ агента с номером созданного тикета |
 | [`screen/tokens.png`](screen/tokens.png) | Запись обоих циклов в YDB (`messages`): `tokens_in`/`tokens_out`/`latency_ms`/`model` |
+| [`screen/trace.png`](screen/trace.png) | Трейс в AI Studio «Логирование»: полный запрос с определениями инструментов (`file_search`, `create-ticket`, `list-my-tickets`), найденные документы индекса и итоговый ответ модели |
 
 **Что не работает / известные ограничения:**
 
