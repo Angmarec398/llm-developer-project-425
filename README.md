@@ -375,6 +375,17 @@ Desk-ящик):
   gateway, `execution get` workflow, AI Studio «Логирование» с полным
   `usage`); токены в YDB точно совпадают с `usage` из ответа Responses API.
 
+**Скриншоты сквозного сценария** (папка [`screen/`](screen/), сценарий 1 из
+шага 9 — «сломался принтер»):
+
+| Файл | Что на нём |
+|---|---|
+| [`screen/question.png`](screen/question.png) | Письмо-обращение на Help Desk-ящик: «У меня сломался принтер, что делать?» |
+| [`screen/answer.png`](screen/answer.png) | Ответ агента по базе знаний (`Источник: it-equipment.md`), тикет не создан |
+| [`screen/question 2.png`](screen/question%202.png) | Письмо-уточнение в том же треде: «Не помогло, создай тикет категория bug» |
+| [`screen/answer 2.png`](screen/answer%202.png) | Ответ агента с номером созданного тикета |
+| [`screen/tokens.png`](screen/tokens.png) | Запись обоих циклов в YDB (`messages`): `tokens_in`/`tokens_out`/`latency_ms`/`model` |
+
 **Что не работает / известные ограничения:**
 
 - **Модель в проде — не YandexGPT.** Стек проекта описывает YandexGPT, но
