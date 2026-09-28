@@ -20,7 +20,7 @@ Help Desk-агент: принимает обращения сотруднико
 ```bash
 git clone <URL_РЕПОЗИТОРИЯ>
 cd llm-developer-project-425
-cp .env.example .env   # заполняется значениями по ходу шагов ниже
+cp .env.example .env
 ```
 
 **1. Сервисный аккаунт и роли на каталоге**
@@ -42,12 +42,12 @@ done
 
 ```bash
 yc ydb database create help-desk-db --serverless --location-id ru-central1
-yc ydb database get help-desk-db   # взять endpoint и database path в .env
+yc ydb database get help-desk-db   
 
 export YDB_ENDPOINT=grpcs://ydb.serverless.yandexcloud.net:2135
 export YDB_DATABASE=/ru-central1/<cloud-id>/<database-id>
 export YC_IAM_TOKEN=$(yc iam create-token)
-python scripts/init_schema.py   # применяет src/ydb_tickets/schema.sql
+python scripts/init_schema.py   
 ```
 
 **3. Секреты в Lockbox**
@@ -76,7 +76,6 @@ yandex-ai-studio vector-stores local create \
   knowledge_base/hr-komandirovka.md knowledge_base/hr-otpusk.md \
   knowledge_base/it-equipment.md knowledge_base/it-password-reset.md \
   knowledge_base/it-vpn.md
-# сохранить search_index_id → SEARCH_INDEX_ID в .env
 ```
 
 **5. Cloud Function `ydb-tickets` + MCP-шлюз**
@@ -108,8 +107,7 @@ mkdir -p /tmp/email-poller && cp src/email_poller.py src/pii_mask.py \
   src/requirements.txt /tmp/email-poller/
 cp -r knowledge_base /tmp/email-poller/
 (cd /tmp/email-poller && zip -jr ../email-poller.zip . )
-# (knowledge_base — подпапкой, поэтому zip без -j для неё же;
-# на Windows — Compress-Archive из общей временной папки, см. CLAUDE.md)
+
 
 yc serverless function create --name email-poller
 yc serverless function version create \
